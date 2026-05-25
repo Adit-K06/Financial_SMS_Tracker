@@ -1,0 +1,10 @@
+# Railway deployment configuration for SMS Tracker Backend
+[build]
+# Use the Dockerfile in the backend directory
+dockerfilePath = "backend/Dockerfile"
+watchPatterns = ["backend/**"]
+
+[deploy]
+startCommand = "./start.sh"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
