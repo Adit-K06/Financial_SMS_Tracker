@@ -25,6 +25,23 @@ app.add_middleware(
 # Environment Variables
 WHATSAPP_GROUP_JID = os.getenv("WHATSAPP_GROUP_JID", "")
 WHATSAPP_BRIDGE_URL = os.getenv("WHATSAPP_BRIDGE_URL", "http://localhost:3000/send")
+WHATSAPP_BRIDGE_BASE = WHATSAPP_BRIDGE_URL.rsplit("/send", 1)[0]  # Base URL e.g. http://localhost:3000
+
+@app.get("/qr")
+def get_qr_code():
+    """Proxy the WhatsApp QR code page from the bridge so users can scan from their Render URL."""
+    try:
+        response = requests.get(f"{WHATSAPP_BRIDGE_BASE}/qr", timeout=5)
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=response.text, status_code=response.status_code)
+    except Exception as e:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(
+            content=f"<html><body style='background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px'>"
+                    f"<h2>⚠️ Bridge Unavailable</h2><p>WhatsApp bridge not yet started: {e}</p>"
+                    f"<p style='color:#a1a1aa'>Please wait 30 seconds and refresh this page.</p></body></html>",
+            status_code=503
+        )
 
 class Transaction(BaseModel):
     type: str # 'debit' or 'credit'
