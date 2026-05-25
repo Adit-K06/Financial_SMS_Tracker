@@ -1,3 +1,7 @@
+// Polyfill globalThis.crypto for Node.js < 19 (required by Baileys)
+import { webcrypto } from 'crypto';
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
+
 import baileys from '@whiskeysockets/baileys';
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
 import QRCode from 'qrcode';
