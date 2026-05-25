@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "WhatsApp Web bridge using Baileys",
   "main": "whatsapp-bridge.js",
-  "type": "module",
   "scripts": {
     "start": "node whatsapp-bridge.js"
   },
