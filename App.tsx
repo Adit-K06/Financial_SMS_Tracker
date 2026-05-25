@@ -105,8 +105,8 @@ function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction |
 export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [status, setStatus] = useState('Initializing tracker...');
-  const [backendUrl, setBackendUrl] = useState('http://10.0.2.2:8000'); // Default emulator IP
-  const [groupJid, setGroupJid] = useState('');
+  const [backendUrl, setBackendUrl] = useState('https://sms-tracker-backend.onrender.com');
+  const [groupJid, setGroupJid] = useState('Financial Sheets');
   
   // Settings Panel State
   const [showSettings, setShowSettings] = useState(false);
@@ -163,7 +163,9 @@ export default function App() {
       const savedSyncs = await AsyncStorage.getItem('@synced_ids');
 
       if (savedUrl) setBackendUrl(savedUrl);
+      else setBackendUrl('https://sms-tracker-backend.onrender.com'); // Live cloud default
       if (savedJid) setGroupJid(savedJid);
+      else setGroupJid('Financial Sheets'); // Default group
       if (savedSyncs) {
         setSyncedIds(JSON.parse(savedSyncs));
       }
@@ -474,7 +476,7 @@ export default function App() {
             <Text style={styles.inputLabel}>FastAPI Backend URL</Text>
             <TextInput
               style={styles.input}
-              placeholder="e.g., http://192.168.1.5:8000"
+              placeholder="https://sms-tracker-backend.onrender.com"
               placeholderTextColor="#71717a"
               value={backendUrl}
               onChangeText={setBackendUrl}
@@ -482,13 +484,13 @@ export default function App() {
               autoCorrect={false}
             />
             <Text style={styles.inputHelp}>
-              Use 10.0.2.2:8000 for Android Emulator, or local network IP (e.g. 192.168.x.x) for physical phones.
+              Pre-configured to your live Render cloud backend. Change only if hosting elsewhere.
             </Text>
 
             <Text style={styles.inputLabel}>WhatsApp Group JID (Optional)</Text>
             <TextInput
               style={styles.input}
-              placeholder="e.g., 1203631987654321@g.us"
+              placeholder="Financial Sheets"
               placeholderTextColor="#71717a"
               value={groupJid}
               onChangeText={setGroupJid}
@@ -496,7 +498,7 @@ export default function App() {
               autoCorrect={false}
             />
             <Text style={styles.inputHelp}>
-              Will automatically forward parsed transactions to this WhatsApp Group ID if configured in backend environment variables.
+              Pre-configured to forward to "Financial Sheets". The backend auto-finds this group by name.
             </Text>
 
             <View style={styles.settingsActionRow}>
