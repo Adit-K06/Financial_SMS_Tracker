@@ -10,13 +10,14 @@
         "READ_SMS"
       ]
     },
-    "extra": {
-      "eas": {
-        "projectId": "3b091404-3cf8-4578-b26b-524a45500517"
-      }
-    },
     "ios": {
       "bundleIdentifier": "com.adit.smstracker"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "04258406-6ab3-40d3-a312-0a17801d5179"
+      }
+    },
+    "owner": "adit_k_2028"
   }
 }
