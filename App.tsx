@@ -44,18 +44,17 @@ type Transaction = {
   synced: boolean;
 };
 
-// --- PARSER ---
 function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction | null {
   const text = smsBody.toLowerCase();
 
-  const isDebit = text.includes('debited') || text.includes('debit') || text.includes('spent') || text.includes('paid');
-  const isCredit = text.includes('credited') || text.includes('credit') || text.includes('received');
+  const isDebit = text.includes('debited') || text.includes('debit') || text.includes('spent') || text.includes('paid') || text.includes('sent') || text.includes('withdrawn') || text.includes('dr.');
+  const isCredit = text.includes('credited') || text.includes('credit') || text.includes('received') || text.includes('added') || text.includes('cr.');
 
   if (!isDebit && !isCredit) return null;
 
-  // Match currency amount: Rs. 100, Rs 100, INR 100, Rs.100.00
+  // Match currency amount: Rs. 100, Rs 100, INR 100, Rs.100.00, or Rupee symbol (₹)
   const amountMatch = smsBody.match(
-    /(?:rs\.?|inr\.?)\s*([\d,]+(?:\.\d+)?)/i
+    /(?:rs\.?|inr\.?|₹)\s*([\d,]+(?:\.\d+)?)/i
   );
 
   if (!amountMatch) return null;
@@ -65,33 +64,48 @@ function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction |
 
   let name = 'Unknown Merchant';
 
-  // Pattern A: "... debited for Rs ... on ...; NAME credited"
-  const matchA = smsBody.match(/debited for Rs.*?on.*?;\s*(.*?)\s+credited/i);
-  if (matchA) {
-    name = matchA[1].trim();
+  // 1. Try extracting from "Info: UPI/..." format
+  const upiMatch = smsBody.match(/info:\s*upi\/[^\/]+\/([^\/]+)/i);
+  if (upiMatch && upiMatch[1].trim().length > 1) {
+    name = upiMatch[1].trim();
   } else {
-    // Pattern B: "... credited with Rs ... on ... from NAME. UPI:"
-    const matchB = smsBody.match(/credited with Rs.*?from\s+([A-Za-z0-9\s]+?)(?:\.|\s+UPI|on\s|$|Ref)/i);
-    if (matchB) {
-      name = matchB[1].trim();
+    // 2. Try Pattern A: "... debited for Rs ... on ...; NAME credited"
+    const matchA = smsBody.match(/debited for (?:rs\.?|inr\.?|₹).*?on.*?;\s*(.*?)\s+credited/i);
+    if (matchA) {
+      name = matchA[1].trim();
     } else {
-      // Pattern C: "... towards NAME for/on/Ref"
-      const matchC = smsBody.match(/towards\s+([A-Za-z0-9\s#\-]+?)\s+(?:for|on|ref|vpa|upi|$)/i);
-      if (matchC) {
-        name = matchC[1].trim();
+      // 3. Try Pattern B: "... credited with Rs ... on ... from NAME. UPI:"
+      const matchB = smsBody.match(/credited with (?:rs\.?|inr\.?|₹).*?from\s+([A-Za-z0-9\s]+?)(?:\.|\s+UPI|on\s|$|Ref)/i);
+      if (matchB) {
+        name = matchB[1].trim();
       } else {
-        // Generic pattern fallback
-        const namePatterns = [
-          /(?:at|to|from|info:|trf to|transfer to)\s+([A-Za-z0-9\s#\-]+?)(?:\.|\s+UPI|on\s|$|Ref)/i,
-        ];
-        for (const pattern of namePatterns) {
-          const match = smsBody.match(pattern);
-          if (match && match[1].trim().length > 1) {
-            name = match[1].trim();
-            break;
+        // 4. Try Pattern C: "... towards NAME for/on/Ref"
+        const matchC = smsBody.match(/towards\s+([A-Za-z0-9\s#\-]+?)\s+(?:for|on|ref|vpa|upi|$)/i);
+        if (matchC) {
+          name = matchC[1].trim();
+        } else {
+          // 5. Generic pattern fallback
+          const namePatterns = [
+            /(?:at|to|from|info:|trf to|transfer to)\s+([A-Za-z0-9\s#\-\/]+?)(?:\.|\s+UPI|on\s|$|Ref)/i,
+          ];
+          for (const pattern of namePatterns) {
+            const match = smsBody.match(pattern);
+            if (match && match[1].trim().length > 1) {
+              name = match[1].trim();
+              break;
+            }
           }
         }
       }
+    }
+  }
+
+  // Clean up if name got parsed with slashes or UPI parts (common in ICICI/HDFC UPI messages)
+  if (name.includes('/')) {
+    const parts = name.split('/');
+    const cleanPart = parts.find(p => p.trim() && !/^\d+$/.test(p) && p.toLowerCase() !== 'upi');
+    if (cleanPart) {
+      name = cleanPart.trim();
     }
   }
 
