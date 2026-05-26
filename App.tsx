@@ -12,11 +12,26 @@ import {
   ScrollView,
   StatusBar,
   Animated,
+  Linking,
 } from 'react-native';
 import { NativeModules } from 'react-native';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const SmsReader: { list: (filter: string, fail: (e: string) => void, success: (count: number, smsList: string) => void) => void } | undefined = (NativeModules as any).SmsReader;
 import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Fetch with timeout helper (handles Render cold starts)
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 20000): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return res;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
 
 // --- TYPES ---
 type Transaction = {
@@ -186,7 +201,8 @@ export default function App() {
   }
 
   // --- HEALTH PING ---
-  async function testBackendConnection() {
+  // Retries up to maxRetries times with delay to handle Render cold starts (~30-60s wake-up)
+  async function testBackendConnection(maxRetries = 2) {
     if (!backendUrl) {
       setApiStatus('offline');
       setWhatsappStatus('unreachable');
@@ -194,27 +210,40 @@ export default function App() {
     }
 
     setApiStatus('checking');
-    try {
-      const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
-      const response = await fetch(`${cleanUrl}/`, { method: 'GET' });
-      
-      if (response.ok) {
-        const data = await response.json();
-        setApiStatus('online');
-        if (data.whatsapp_status === 'connected') {
-          setWhatsappStatus('connected');
-        } else if (data.whatsapp_status === 'disconnected') {
-          setWhatsappStatus('disconnected');
+    const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          setStatus(`Backend waking up... retry ${attempt}/${maxRetries}`);
+          await new Promise(r => setTimeout(r, 8000)); // wait 8s between retries
+        }
+        // Use 20s timeout — Render free tier needs up to ~60s on cold start
+        const response = await fetchWithTimeout(`${cleanUrl}/`, { method: 'GET' }, 20000);
+
+        if (response.ok) {
+          const data = await response.json();
+          setApiStatus('online');
+          if (data.whatsapp_status === 'connected') {
+            setWhatsappStatus('connected');
+          } else if (data.whatsapp_status === 'disconnected') {
+            // Disconnected = bridge is up but QR not scanned yet
+            setWhatsappStatus('disconnected');
+          } else {
+            setWhatsappStatus('unreachable');
+          }
+          return; // success — stop retrying
         } else {
+          setApiStatus('offline');
           setWhatsappStatus('unreachable');
         }
-      } else {
-        setApiStatus('offline');
-        setWhatsappStatus('unreachable');
+      } catch (error) {
+        if (attempt === maxRetries) {
+          setApiStatus('offline');
+          setWhatsappStatus('unreachable');
+          setStatus('Backend offline. Check your Render deployment.');
+        }
       }
-    } catch (error) {
-      setApiStatus('offline');
-      setWhatsappStatus('unreachable');
     }
   }
 
@@ -501,10 +530,28 @@ export default function App() {
               Pre-configured to forward to "Financial Sheets". The backend auto-finds this group by name.
             </Text>
 
+            {/* WhatsApp QR Scan Banner */}
+            {whatsappStatus !== 'connected' && (
+              <TouchableOpacity
+                style={styles.qrBanner}
+                onPress={() => {
+                  const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
+                  Linking.openURL(`${cleanUrl}/qr`);
+                }}
+              >
+                <Text style={styles.qrBannerIcon}>📱</Text>
+                <View style={styles.qrBannerText}>
+                  <Text style={styles.qrBannerTitle}>WhatsApp Not Linked</Text>
+                  <Text style={styles.qrBannerSub}>Tap to open QR page → scan with WhatsApp</Text>
+                </View>
+                <Text style={styles.qrBannerArrow}>→</Text>
+              </TouchableOpacity>
+            )}
+
             <View style={styles.settingsActionRow}>
               <TouchableOpacity 
                 style={styles.testBtn} 
-                onPress={testBackendConnection}
+                onPress={() => testBackendConnection(3)}
               >
                 <Text style={styles.btnText}>⚡ Test Link</Text>
               </TouchableOpacity>
@@ -949,5 +996,37 @@ const styles = StyleSheet.create({
     fontSize: 10,
     color: '#52525b',
     lineHeight: 13,
+  },
+  qrBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1a0f2e',
+    borderWidth: 1,
+    borderColor: '#6d28d9',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    gap: 10,
+  },
+  qrBannerIcon: {
+    fontSize: 22,
+  },
+  qrBannerText: {
+    flex: 1,
+  },
+  qrBannerTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#a78bfa',
+  },
+  qrBannerSub: {
+    fontSize: 11,
+    color: '#7c6da0',
+    marginTop: 2,
+  },
+  qrBannerArrow: {
+    fontSize: 18,
+    color: '#6d28d9',
+    fontWeight: '700',
   },
 });
