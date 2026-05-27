@@ -13,6 +13,9 @@
     "ios": {
       "bundleIdentifier": "com.adit.smstracker"
     },
+    "plugins": [
+      "./plugins/withSmsReader"
+    ],
     "extra": {
       "eas": {
         "projectId": "04258406-6ab3-40d3-a312-0a17801d5179"
