@@ -48,27 +48,33 @@ class SmsReaderModule(reactContext: ReactApplicationContext) :
                 return
             }
 
-            val maxCount: Int = try {
-                JSONObject(filterJson).optInt("maxCount", 50)
-            } catch (e: Exception) {
-                50
-            }
+            val filterObj = try { JSONObject(filterJson) } catch (e: Exception) { JSONObject() }
+            val maxCount  = filterObj.optInt("maxCount", 50)
+            val minDate   = filterObj.optLong("minDate", 0L)  // epoch ms; 0 = no filter
 
-            val uri = Uri.parse("content://sms/inbox")
+            val uri        = Uri.parse("content://sms/inbox")
             val projection = arrayOf("_id", "address", "body", "date", "read")
 
+            // Apply minDate WHERE clause at the database level for efficiency
+            val selection     = if (minDate > 0L) "date >= ?" else null
+            val selectionArgs = if (minDate > 0L) arrayOf(minDate.toString()) else null
+
             val cursor = context.contentResolver.query(
-                uri, projection, null, null, "date DESC LIMIT \$maxCount"
+                uri,
+                projection,
+                selection,
+                selectionArgs,
+                "date DESC LIMIT \${maxCount}"
             )
 
             val resultArray = JSONArray()
 
             cursor?.use { c ->
-                val idIdx    = c.getColumnIndex("_id")
-                val addrIdx  = c.getColumnIndex("address")
-                val bodyIdx  = c.getColumnIndex("body")
-                val dateIdx  = c.getColumnIndex("date")
-                val readIdx  = c.getColumnIndex("read")
+                val idIdx   = c.getColumnIndex("_id")
+                val addrIdx = c.getColumnIndex("address")
+                val bodyIdx = c.getColumnIndex("body")
+                val dateIdx = c.getColumnIndex("date")
+                val readIdx = c.getColumnIndex("read")
 
                 while (c.moveToNext()) {
                     val obj = JSONObject()

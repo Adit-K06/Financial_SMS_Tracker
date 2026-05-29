@@ -6,7 +6,6 @@
     "android": {
       "package": "com.adit.smstracker",
       "permissions": [
-        "RECEIVE_SMS",
         "READ_SMS"
       ]
     },

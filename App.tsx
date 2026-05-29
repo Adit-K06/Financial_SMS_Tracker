@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -7,31 +7,16 @@ import {
   PermissionsAndroid,
   Platform,
   TouchableOpacity,
-  TextInput,
   ActivityIndicator,
   ScrollView,
   StatusBar,
   Animated,
-  Linking,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import { NativeModules } from 'react-native';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const SmsReader: { list: (filter: string, fail: (e: string) => void, success: (count: number, smsList: string) => void) => void } | undefined = (NativeModules as any).SmsReader;
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-// Fetch with timeout helper (handles Render cold starts)
-async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 20000): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timeoutId);
-    return res;
-  } catch (e) {
-    clearTimeout(timeoutId);
-    throw e;
-  }
-}
 
 // --- TYPES ---
 type Transaction = {
@@ -41,22 +26,52 @@ type Transaction = {
   name: string;
   raw: string;
   timestamp: Date;
-  synced: boolean;
 };
 
+type ListItem =
+  | { kind: 'header'; dateLabel: string; key: string }
+  | { kind: 'tx'; tx: Transaction; key: string };
+
+// --- TODAY MIDNIGHT (start of today in local time) ---
+function getTodayMidnight(): number {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+}
+
+// --- DATE LABEL ---
+function getDateLabel(date: Date): string {
+  const today = new Date();
+  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const dateMidnight = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const diffDays = Math.round((todayMidnight - dateMidnight) / 86400000);
+
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  return date.toLocaleDateString('en-IN', { weekday: 'long', day: '2-digit', month: 'short' });
+}
+
+// --- SMS PARSER ---
 function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction | null {
   const text = smsBody.toLowerCase();
 
-  const isDebit = text.includes('debited') || text.includes('debit') || text.includes('spent') || text.includes('paid') || text.includes('sent') || text.includes('withdrawn') || text.includes('dr.');
-  const isCredit = text.includes('credited') || text.includes('credit') || text.includes('received') || text.includes('added') || text.includes('cr.');
+  const isDebit =
+    text.includes('debited') ||
+    text.includes('debit') ||
+    text.includes('spent') ||
+    text.includes('paid') ||
+    text.includes('sent') ||
+    text.includes('withdrawn') ||
+    text.includes('dr.');
+  const isCredit =
+    text.includes('credited') ||
+    text.includes('credit') ||
+    text.includes('received') ||
+    text.includes('added') ||
+    text.includes('cr.');
 
   if (!isDebit && !isCredit) return null;
 
-  // Match currency amount: Rs. 100, Rs 100, INR 100, Rs.100.00, or Rupee symbol (₹)
-  const amountMatch = smsBody.match(
-    /(?:rs\.?|inr\.?|₹)\s*([\d,]+(?:\.\d+)?)/i
-  );
-
+  const amountMatch = smsBody.match(/(?:rs\.?|inr\.?|₹)\s*([\d,]+(?:\.\d+)?)/i);
   if (!amountMatch) return null;
 
   const amount = parseFloat(amountMatch[1].replace(/,/g, ''));
@@ -64,27 +79,22 @@ function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction |
 
   let name = 'Unknown Merchant';
 
-  // 1. Try extracting from "Info: UPI/..." format
   const upiMatch = smsBody.match(/info:\s*upi\/[^\/]+\/([^\/]+)/i);
   if (upiMatch && upiMatch[1].trim().length > 1) {
     name = upiMatch[1].trim();
   } else {
-    // 2. Try Pattern A: "... debited for Rs ... on ...; NAME credited"
     const matchA = smsBody.match(/debited for (?:rs\.?|inr\.?|₹).*?on.*?;\s*(.*?)\s+credited/i);
     if (matchA) {
       name = matchA[1].trim();
     } else {
-      // 3. Try Pattern B: "... credited with Rs ... on ... from NAME. UPI:"
       const matchB = smsBody.match(/credited with (?:rs\.?|inr\.?|₹).*?from\s+([A-Za-z0-9\s]+?)(?:\.|\s+UPI|on\s|$|Ref)/i);
       if (matchB) {
         name = matchB[1].trim();
       } else {
-        // 4. Try Pattern C: "... towards NAME for/on/Ref"
         const matchC = smsBody.match(/towards\s+([A-Za-z0-9\s#\-]+?)\s+(?:for|on|ref|vpa|upi|$)/i);
         if (matchC) {
           name = matchC[1].trim();
         } else {
-          // 5. Generic pattern fallback
           const namePatterns = [
             /(?:at|to|from|info:|trf to|transfer to)\s+([A-Za-z0-9\s#\-\/]+?)(?:\.|\s+UPI|on\s|$|Ref)/i,
           ];
@@ -100,24 +110,14 @@ function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction |
     }
   }
 
-  // Clean up if name got parsed with slashes or UPI parts (common in ICICI/HDFC UPI messages)
   if (name.includes('/')) {
     const parts = name.split('/');
     const cleanPart = parts.find(p => p.trim() && !/^\d+$/.test(p) && p.toLowerCase() !== 'upi');
-    if (cleanPart) {
-      name = cleanPart.trim();
-    }
+    if (cleanPart) name = cleanPart.trim();
   }
 
-  // Sanitize name a bit
-  name = name
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // Limit name length for display elegance
-  if (name.length > 25) {
-    name = name.substring(0, 22) + '...';
-  }
+  name = name.replace(/\s+/g, ' ').trim();
+  if (name.length > 25) name = name.substring(0, 22) + '...';
 
   return {
     id: smsId || Date.now().toString(),
@@ -126,56 +126,56 @@ function parseSMS(smsBody: string, smsId: string, dateMs: number): Transaction |
     name: name || 'General Transaction',
     raw: smsBody,
     timestamp: new Date(dateMs),
-    synced: false,
   };
+}
+
+// --- GROUP TRANSACTIONS BY DATE ---
+function groupByDate(transactions: Transaction[]): ListItem[] {
+  const items: ListItem[] = [];
+  let lastLabel = '';
+
+  // Sort newest first
+  const sorted = [...transactions].sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+  for (const tx of sorted) {
+    const label = getDateLabel(tx.timestamp);
+    if (label !== lastLabel) {
+      items.push({ kind: 'header', dateLabel: label, key: `header-${label}` });
+      lastLabel = label;
+    }
+    items.push({ kind: 'tx', tx, key: `tx-${tx.id}` });
+  }
+  return items;
 }
 
 // --- MAIN APP ---
 export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [status, setStatus] = useState('Initializing tracker...');
-  const [backendUrl, setBackendUrl] = useState('https://sms-tracker-backend.onrender.com');
-  const [groupJid, setGroupJid] = useState('Financial Sheets');
-  
-  // Settings Panel State
-  const [showSettings, setShowSettings] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
-  
-  // Connection Status States
-  const [apiStatus, setApiStatus] = useState<'online' | 'offline' | 'checking'>('checking');
-  const [whatsappStatus, setWhatsappStatus] = useState<'connected' | 'disconnected' | 'unreachable'>('unreachable');
-  
-  // Async Synced Messages ID tracking
-  const [syncedIds, setSyncedIds] = useState<string[]>([]);
+  const [permissionGranted, setPermissionGranted] = useState(false);
 
-  // Rotating Sync Animation
+  // Pulse animation for the live dot
+  const pulseAnim = useRef(new Animated.Value(1)).current;
   const rotateAnim = useRef(new Animated.Value(0)).current;
 
-  // Initialize
-  useEffect(() => {
-    loadSettings();
-    checkPermissionsAndSync();
-    
-    // Set up background polling interval (every 15 seconds)
-    const interval = setInterval(() => {
-      autoSyncOnly();
-    }, 15000);
+  // Keep refs to avoid stale closures in intervals
+  const isSyncingRef = useRef(false);
+  const permissionRef = useRef(false);
 
-    return () => clearInterval(interval);
+  // --- PULSE ANIMATION (live indicator) ---
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 0.3, duration: 900, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 900, useNativeDriver: true }),
+      ])
+    ).start();
   }, []);
-
-  // Set up settings ping on backend changes
-  useEffect(() => {
-    testBackendConnection();
-  }, [backendUrl]);
 
   const startSyncAnimation = () => {
     Animated.loop(
-      Animated.timing(rotateAnim, {
-        toValue: 1,
-        duration: 1000,
-        useNativeDriver: true,
-      })
+      Animated.timing(rotateAnim, { toValue: 1, duration: 1000, useNativeDriver: true })
     ).start();
   };
 
@@ -184,507 +184,286 @@ export default function App() {
     rotateAnim.stopAnimation();
   };
 
-  // --- STORAGE CONFIGS ---
-  async function loadSettings() {
-    try {
-      const savedUrl = await AsyncStorage.getItem('@backend_url');
-      const savedJid = await AsyncStorage.getItem('@group_jid');
-      const savedSyncs = await AsyncStorage.getItem('@synced_ids');
+  const spin = rotateAnim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
 
-      if (savedUrl) setBackendUrl(savedUrl);
-      else setBackendUrl('https://sms-tracker-backend.onrender.com'); // Live cloud default
-      if (savedJid) setGroupJid(savedJid);
-      else setGroupJid('Financial Sheets'); // Default group
-      if (savedSyncs) {
-        setSyncedIds(JSON.parse(savedSyncs));
-      }
-    } catch (e) {
-      console.error('Failed to load settings', e);
-    }
-  }
-
-  async function saveSettings(url: string, jid: string) {
-    try {
-      await AsyncStorage.setItem('@backend_url', url);
-      await AsyncStorage.setItem('@group_jid', jid);
-      setStatus('Settings saved successfully!');
-      testBackendConnection();
-    } catch (e) {
-      setStatus('Failed to save settings');
-    }
-  }
-
-  // --- HEALTH PING ---
-  // Retries up to maxRetries times with delay to handle Render cold starts (~30-60s wake-up)
-  async function testBackendConnection(maxRetries = 2) {
-    if (!backendUrl) {
-      setApiStatus('offline');
-      setWhatsappStatus('unreachable');
-      return;
-    }
-
-    setApiStatus('checking');
-    const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      try {
-        if (attempt > 0) {
-          setStatus(`Backend waking up... retry ${attempt}/${maxRetries}`);
-          await new Promise(r => setTimeout(r, 8000)); // wait 8s between retries
-        }
-        // Use 20s timeout — Render free tier needs up to ~60s on cold start
-        const response = await fetchWithTimeout(`${cleanUrl}/`, { method: 'GET' }, 20000);
-
-        if (response.ok) {
-          const data = await response.json();
-          setApiStatus('online');
-          if (data.whatsapp_status === 'connected') {
-            setWhatsappStatus('connected');
-          } else if (data.whatsapp_status === 'disconnected') {
-            // Disconnected = bridge is up but QR not scanned yet
-            setWhatsappStatus('disconnected');
-          } else {
-            setWhatsappStatus('unreachable');
-          }
-          return; // success — stop retrying
-        } else {
-          setApiStatus('offline');
-          setWhatsappStatus('unreachable');
-        }
-      } catch (error) {
-        if (attempt === maxRetries) {
-          setApiStatus('offline');
-          setWhatsappStatus('unreachable');
-          setStatus('Backend offline. Check your Render deployment.');
-        }
-      }
-    }
-  }
-
-  // --- PERMISSIONS AND SYNC ---
+  // --- PERMISSIONS ---
   async function requestPermissions(): Promise<boolean> {
     if (Platform.OS !== 'android') return false;
-
     const results = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.READ_SMS,
       PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
     ]);
-
     return (
       results['android.permission.READ_SMS'] === 'granted' &&
       results['android.permission.RECEIVE_SMS'] === 'granted'
     );
   }
 
-  async function checkPermissionsAndSync() {
-    const granted = await requestPermissions();
-    if (!granted) {
-      setStatus('SMS access denied. Please grant permissions in Android Settings.');
-      return;
-    }
-    runSync();
-  }
-
-  // --- SYNC WORKER ---
-  async function runSync() {
-    if (isSyncing) return;
+  // --- CORE SYNC ---
+  const runSync = useCallback(async (quiet = false) => {
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
     setIsSyncing(true);
-    startSyncAnimation();
-    setStatus('Scanning SMS inbox for bank transactions...');
 
-    // Load recent synced IDs from storage first to ensure up-to-date
-    let currentSynced = [...syncedIds];
-    try {
-      const savedSyncs = await AsyncStorage.getItem('@synced_ids');
-      if (savedSyncs) {
-        currentSynced = JSON.parse(savedSyncs);
-        setSyncedIds(currentSynced);
-      }
-    } catch (e) {
-      console.warn(e);
+    if (!quiet) {
+      startSyncAnimation();
+      setStatus('Scanning SMS inbox for transactions...');
     }
 
     if (!SmsReader) {
       console.warn('SmsReader native module not available');
+      isSyncingRef.current = false;
       setIsSyncing(false);
-      stopSyncAnimation();
+      if (!quiet) stopSyncAnimation();
       return;
     }
+
+    const todayMidnight = getTodayMidnight();
 
     SmsReader.list(
       JSON.stringify({
         box: 'inbox',
-        maxCount: 50,
+        maxCount: 200,           // Fetch more so we cover the full day
+        minDate: todayMidnight,  // Only today's messages
       }),
       (fail: string) => {
         console.error('SMS list failed:', fail);
         setStatus('Failed to read SMS inbox.');
+        isSyncingRef.current = false;
         setIsSyncing(false);
-        stopSyncAnimation();
+        if (!quiet) stopSyncAnimation();
       },
-      async (count: number, smsList: string) => {
-        const messages: Array<{ _id: string; body: string; date: number }> =
-          JSON.parse(smsList);
+      (count: number, smsList: string) => {
+        const messages: Array<{ _id: string; body: string; date: number }> = JSON.parse(smsList);
 
-        // Parse and filter down to bank transactions
-        const parsedList = messages
-          .map((msg) => parseSMS(msg.body, msg._id, msg.date))
+        const todayTxs = messages
+          .filter(msg => msg.date >= todayMidnight)   // Double-filter in case SDK ignores minDate
+          .map(msg => parseSMS(msg.body, msg._id, msg.date))
           .filter(Boolean) as Transaction[];
 
-        // Sync new transactions to backend
-        const newlySynced: string[] = [];
-        let successCount = 0;
+        setTransactions(prev => {
+          // Only update state if something actually changed
+          const prevIds = new Set(prev.map(t => t.id));
+          const newIds = new Set(todayTxs.map(t => t.id));
+          const changed = todayTxs.some(t => !prevIds.has(t.id)) || prev.some(t => !newIds.has(t.id));
+          if (changed) return todayTxs;
+          return prev;
+        });
 
-        for (const tx of parsedList) {
-          const alreadySynced = currentSynced.includes(tx.id);
-          
-          if (!alreadySynced) {
-            setStatus(`Forwarding ₹${tx.amount} to WhatsApp...`);
-            const sent = await forwardToBackend(tx);
-            if (sent) {
-              newlySynced.push(tx.id);
-              tx.synced = true;
-              successCount++;
-            }
-          } else {
-            tx.synced = true;
-          }
-        }
-
-        // Merge newly synced IDs to storage
-        if (newlySynced.length > 0) {
-          const updatedSyncedIds = [...currentSynced, ...newlySynced];
-          setSyncedIds(updatedSyncedIds);
-          await AsyncStorage.setItem('@synced_ids', JSON.stringify(updatedSyncedIds));
-        }
-
-        setTransactions(parsedList);
+        isSyncingRef.current = false;
         setIsSyncing(false);
-        stopSyncAnimation();
-        
-        if (successCount > 0) {
-          setStatus(`Successfully forwarded ${successCount} new transactions!`);
-        } else {
-          setStatus(`Dashboard synced. Listening for new messages...`);
-        }
-        
-        // Dynamic Health Recheck
-        testBackendConnection();
-      }
-    );
-  }
+        if (!quiet) stopSyncAnimation();
 
-  // Quiet sync for background polling (no heavy UI loading indicators)
-  async function autoSyncOnly() {
-    if (isSyncing) return;
-    
-    // Check if permission is granted
-    const hasRead = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_SMS);
-    if (!hasRead) return;
-
-    let currentSynced = [...syncedIds];
-    try {
-      const savedSyncs = await AsyncStorage.getItem('@synced_ids');
-      if (savedSyncs) currentSynced = JSON.parse(savedSyncs);
-    } catch (e) {
-      return;
-    }
-
-    // Use our custom native SmsReader module (no third-party lib)
-    if (!SmsReader) {
-      console.warn('SmsReader native module not available (only works on Android device/emulator)');
-      return;
-    }
-
-    SmsReader.list(
-      JSON.stringify({ box: 'inbox', maxCount: 30 }),
-      (error: string) => {
-        console.warn('SMS read error:', error);
-      },
-      async (count: number, smsList: string) => {
-        const messages = JSON.parse(smsList);
-        const parsedList = messages
-          .map((msg: any) => parseSMS(msg.body, msg._id, msg.date))
-          .filter(Boolean) as Transaction[];
-
-        const newlySynced: string[] = [];
-        let didUpdate = false;
-
-        for (const tx of parsedList) {
-          const alreadySynced = currentSynced.includes(tx.id);
-          if (!alreadySynced) {
-            const sent = await forwardToBackend(tx);
-            if (sent) {
-              newlySynced.push(tx.id);
-              tx.synced = true;
-              didUpdate = true;
-            }
-          } else {
-            tx.synced = true;
-          }
-        }
-
-        if (newlySynced.length > 0) {
-          const updated = [...currentSynced, ...newlySynced];
-          setSyncedIds(updated);
-          await AsyncStorage.setItem('@synced_ids', JSON.stringify(updated));
-        }
-
-        if (didUpdate || transactions.length !== parsedList.length) {
-          setTransactions(parsedList);
+        if (!quiet) {
+          setStatus(`Live • ${todayTxs.length} transaction${todayTxs.length !== 1 ? 's' : ''} today`);
         }
       }
     );
-  }
+  }, []);
 
-  // --- API CALL ---
-  async function forwardToBackend(tx: Transaction): Promise<boolean> {
-    if (!backendUrl) return false;
+  // --- INITIALIZE ---
+  useEffect(() => {
+    (async () => {
+      const granted = await requestPermissions();
+      setPermissionGranted(granted);
+      permissionRef.current = granted;
 
-    const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
-    const targetUrl = `${cleanUrl}/transaction`;
+      if (!granted) {
+        setStatus('SMS access denied. Please grant permissions in Android Settings.');
+        return;
+      }
 
-    try {
-      const response = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: tx.type,
-          amount: tx.amount,
-          name: tx.name,
-          timestamp: tx.timestamp.toISOString(),
-          to: groupJid || undefined, // Pass custom WhatsApp JID or Group Name
-        }),
-      });
+      // Initial full sync
+      runSync(false);
+      setStatus('Live • Watching for new transactions...');
 
-      return response.ok;
-    } catch (error) {
-      console.warn(`Sync failed for ${tx.id}:`, error);
-      return false;
-    }
-  }
+      // Poll every 30 seconds — aggressive enough to feel "instant" but safe for Android
+      const interval = setInterval(() => {
+        if (permissionRef.current) runSync(true);
+      }, 30 * 1000);
 
-  // --- CALCULATE STATS ---
-  const totalDebit = transactions
-    .filter((t) => t.type === 'debit')
-    .reduce((sum, t) => sum + t.amount, 0);
+      return () => clearInterval(interval);
+    })();
+  }, [runSync]);
 
-  const totalCredit = transactions
-    .filter((t) => t.type === 'credit')
-    .reduce((sum, t) => sum + t.amount, 0);
+  // --- FOREGROUND DETECT: sync immediately when app is opened ---
+  useEffect(() => {
+    const handleAppState = (nextState: AppStateStatus) => {
+      if (nextState === 'active' && permissionRef.current) {
+        runSync(true); // Silent sync when app comes to foreground
+      }
+    };
 
-  const spin = rotateAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['0deg', '360deg'],
-  });
+    const sub = AppState.addEventListener('change', handleAppState);
+    return () => sub.remove();
+  }, [runSync]);
+
+  // --- STATS ---
+  const totalDebit = transactions.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+  const totalCredit = transactions.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+  const listItems = groupByDate(transactions);
 
   return (
     <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#121214" />
-      
-      {/* Top Header Section */}
-      <View style={styles.headerContainer}>
+      <StatusBar barStyle="light-content" backgroundColor="#0c0c0e" />
+
+      {/* ── HEADER ── */}
+      <View style={styles.header}>
         <View>
           <Text style={styles.title}>SMS Tracker</Text>
-          <View style={styles.statusRow}>
-            {/* API Status Badge */}
-            <View style={styles.badge}>
-              <View style={[styles.dot, apiStatus === 'online' ? styles.dotGreen : apiStatus === 'checking' ? styles.dotYellow : styles.dotRed]} />
-              <Text style={styles.badgeText}>API: {apiStatus.toUpperCase()}</Text>
-            </View>
-            
-            {/* WhatsApp Status Badge */}
-            <View style={styles.badge}>
-              <View style={[styles.dot, whatsappStatus === 'connected' ? styles.dotGreen : whatsappStatus === 'disconnected' ? styles.dotYellow : styles.dotRed]} />
-              <Text style={styles.badgeText}>WHATSAPP: {whatsappStatus.toUpperCase()}</Text>
-            </View>
+          <View style={styles.liveRow}>
+            <Animated.View style={[styles.liveDot, { opacity: pulseAnim }]} />
+            <Text style={styles.liveText}>LIVE</Text>
+            <Text style={styles.liveSubtext}> • Updates every 30s</Text>
           </View>
         </View>
 
-        <TouchableOpacity 
-          style={[styles.settingsToggleBtn, showSettings && styles.settingsToggleBtnActive]} 
-          onPress={() => setShowSettings(!showSettings)}
+        {/* Manual Sync Button */}
+        <TouchableOpacity
+          style={[styles.syncBtn, isSyncing && styles.syncBtnActive]}
+          onPress={() => runSync(false)}
+          disabled={isSyncing}
         >
-          <Text style={styles.settingsBtnText}>{showSettings ? '✕ Close' : '⚙ Config'}</Text>
+          <Animated.Text style={[styles.syncBtnIcon, isSyncing && { transform: [{ rotate: spin }] }]}>
+            🔄
+          </Animated.Text>
+          <Text style={styles.syncBtnText}>{isSyncing ? 'Syncing' : 'Sync'}</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Main Content */}
-      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-        {/* Dynamic Config Settings Form */}
-        {showSettings && (
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Server Configuration</Text>
-            
-            <Text style={styles.inputLabel}>FastAPI Backend URL</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="https://sms-tracker-backend.onrender.com"
-              placeholderTextColor="#71717a"
-              value={backendUrl}
-              onChangeText={setBackendUrl}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            <Text style={styles.inputHelp}>
-              Pre-configured to your live Render cloud backend. Change only if hosting elsewhere.
-            </Text>
+      {/* ── STATUS BAR ── */}
+      <View style={styles.statusBanner}>
+        {isSyncing && <ActivityIndicator size={12} color="#818cf8" style={{ marginRight: 6 }} />}
+        <Text style={styles.statusText} numberOfLines={1}>{status}</Text>
+      </View>
 
-            <Text style={styles.inputLabel}>WhatsApp Group JID (Optional)</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Financial Sheets"
-              placeholderTextColor="#71717a"
-              value={groupJid}
-              onChangeText={setGroupJid}
-              autoCapitalize="none"
-              autoCorrect={false}
-            />
-            <Text style={styles.inputHelp}>
-              Pre-configured to forward to "Financial Sheets". The backend auto-finds this group by name.
-            </Text>
+      {/* ── MAIN SCROLL ── */}
+      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
 
-            {/* WhatsApp QR Scan Banner */}
-            {whatsappStatus !== 'connected' && (
-              <TouchableOpacity
-                style={styles.qrBanner}
-                onPress={() => {
-                  const cleanUrl = backendUrl.endsWith('/') ? backendUrl.slice(0, -1) : backendUrl;
-                  Linking.openURL(`${cleanUrl}/qr`);
-                }}
-              >
-                <Text style={styles.qrBannerIcon}>📱</Text>
-                <View style={styles.qrBannerText}>
-                  <Text style={styles.qrBannerTitle}>WhatsApp Not Linked</Text>
-                  <Text style={styles.qrBannerSub}>Tap to open QR page → scan with WhatsApp</Text>
-                </View>
-                <Text style={styles.qrBannerArrow}>→</Text>
-              </TouchableOpacity>
-            )}
-
-            <View style={styles.settingsActionRow}>
-              <TouchableOpacity 
-                style={styles.testBtn} 
-                onPress={() => testBackendConnection(3)}
-              >
-                <Text style={styles.btnText}>⚡ Test Link</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={styles.saveBtn} 
-                onPress={() => saveSettings(backendUrl, groupJid)}
-              >
-                <Text style={styles.saveBtnText}>💾 Save Config</Text>
-              </TouchableOpacity>
+        {/* Permission Warning */}
+        {!permissionGranted && (
+          <View style={styles.warningCard}>
+            <Text style={styles.warningIcon}>⚠️</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.warningTitle}>SMS Permission Required</Text>
+              <Text style={styles.warningBody}>
+                Please grant SMS permission in Android Settings to read bank transactions.
+              </Text>
             </View>
           </View>
         )}
 
-        {/* Sync Status Banner */}
-        <View style={styles.statusBanner}>
-          <Text style={styles.statusBannerText} numberOfLines={2}>{status}</Text>
-        </View>
-
-        {/* Metrics Grid */}
+        {/* Metric Cards */}
         <View style={styles.metricGrid}>
-          {/* Card: Total Debits */}
           <View style={[styles.metricCard, styles.debitCard]}>
-            <Text style={styles.metricLabel}>🔴 Total Spent</Text>
-            <Text style={styles.metricValue}>₹{totalDebit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</Text>
-            <View style={styles.metricLine} />
+            <Text style={styles.metricEmoji}>💸</Text>
+            <Text style={styles.metricLabel}>Total Spent</Text>
+            <Text style={[styles.metricValue, styles.debitValue]}>
+              ₹{totalDebit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </Text>
+            <Text style={styles.metricSub}>{transactions.filter(t => t.type === 'debit').length} debits today</Text>
           </View>
-          
-          {/* Card: Total Credits */}
+
           <View style={[styles.metricCard, styles.creditCard]}>
-            <Text style={styles.metricLabel}>🟢 Total Received</Text>
-            <Text style={styles.metricValue}>₹{totalCredit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</Text>
-            <View style={styles.metricLine} />
+            <Text style={styles.metricEmoji}>💰</Text>
+            <Text style={styles.metricLabel}>Total Received</Text>
+            <Text style={[styles.metricValue, styles.creditValue]}>
+              ₹{totalCredit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </Text>
+            <Text style={styles.metricSub}>{transactions.filter(t => t.type === 'credit').length} credits today</Text>
           </View>
         </View>
 
-        {/* Sync Trigger button */}
-        <TouchableOpacity 
-          style={styles.syncButton} 
-          onPress={runSync}
-          disabled={isSyncing}
-        >
-          <Animated.View style={isSyncing ? { transform: [{ rotate: spin }] } : {}}>
-            <Text style={styles.syncIcon}>🔄</Text>
-          </Animated.View>
-          <Text style={styles.syncButtonText}>
-            {isSyncing ? 'Syncing Transactions...' : 'Sync Transactions Now'}
-          </Text>
-        </TouchableOpacity>
-
-        {/* Transactions list header */}
-        <View style={styles.listHeaderRow}>
-          <Text style={styles.listSectionTitle}>Transactions List</Text>
-          <Text style={styles.listSectionCount}>{transactions.length} detected</Text>
+        {/* Transactions Header */}
+        <View style={styles.sectionHeaderRow}>
+          <Text style={styles.sectionTitle}>Today's Transactions</Text>
+          <View style={styles.countPill}>
+            <Text style={styles.countText}>{transactions.length}</Text>
+          </View>
         </View>
 
-        {/* Transactions FlatList Container */}
-        <FlatList
-          data={transactions}
-          scrollEnabled={false} // Nested inside ScrollView
-          keyExtractor={(item) => item.id}
-          ListEmptyComponent={
-            <View style={styles.emptyContainer}>
-              <Text style={styles.emptyIcon}>📂</Text>
-              <Text style={styles.emptyText}>No financial transactions found in recent messages.</Text>
-              <Text style={styles.emptySubtext}>We scan for keywords like spent, debited, credited, received, and Rs./INR.</Text>
-            </View>
-          }
-          renderItem={({ item }) => (
-            <View style={[styles.txCard, item.type === 'debit' ? styles.txDebitBorder : styles.txCreditBorder]}>
-              <View style={styles.txRow}>
-                <View style={styles.txLeft}>
-                  <Text style={styles.txMerchant}>{item.name}</Text>
-                  <Text style={styles.txTime}>
-                    {item.timestamp.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })} • {item.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </Text>
-                </View>
-                
-                <View style={styles.txRight}>
-                  <Text style={[styles.txAmount, item.type === 'debit' ? styles.txDebitColor : styles.txCreditColor]}>
-                    {item.type === 'debit' ? '-' : '+'} ₹{item.amount.toFixed(2)}
-                  </Text>
-                  
-                  {/* Sync Status Badge */}
-                  <View style={[styles.syncBadge, item.synced ? styles.syncBadgeDone : styles.syncBadgeLocal]}>
-                    <Text style={[styles.syncBadgeText, item.synced ? styles.syncBadgeTextDone : styles.syncBadgeTextLocal]}>
-                      {item.synced ? '✓ WA PUSHED' : '⧗ LOCAL ONLY'}
+        {/* Transaction List with Date Dividers */}
+        {listItems.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyIcon}>📭</Text>
+            <Text style={styles.emptyTitle}>No transactions today</Text>
+            <Text style={styles.emptyBody}>
+              We're monitoring your SMS inbox from this morning. Bank transaction messages will appear here automatically.
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={listItems}
+            scrollEnabled={false}
+            keyExtractor={item => item.key}
+            renderItem={({ item }) => {
+              if (item.kind === 'header') {
+                return (
+                  <View style={styles.dateDivider}>
+                    <View style={styles.dateLine} />
+                    <View style={styles.datePill}>
+                      <Text style={styles.datePillText}>{item.dateLabel}</Text>
+                    </View>
+                    <View style={styles.dateLine} />
+                  </View>
+                );
+              }
+
+              const tx = item.tx;
+              const isDebit = tx.type === 'debit';
+
+              return (
+                <View style={[styles.txCard, isDebit ? styles.txDebitBorder : styles.txCreditBorder]}>
+                  <View style={styles.txRow}>
+                    {/* Icon + Name */}
+                    <View style={[styles.txIconWrap, isDebit ? styles.txIconDebit : styles.txIconCredit]}>
+                      <Text style={styles.txIcon}>{isDebit ? '↑' : '↓'}</Text>
+                    </View>
+
+                    <View style={styles.txMeta}>
+                      <Text style={styles.txName}>{tx.name}</Text>
+                      <Text style={styles.txTime}>
+                        {tx.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </Text>
+                    </View>
+
+                    {/* Amount */}
+                    <Text style={[styles.txAmount, isDebit ? styles.txDebitAmt : styles.txCreditAmt]}>
+                      {isDebit ? '−' : '+'} ₹{tx.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </Text>
                   </View>
-                </View>
-              </View>
 
-              {/* Collapsed Raw Details */}
-              <View style={styles.rawContainer}>
-                <Text style={styles.rawText} numberOfLines={2}>
-                  {item.raw}
-                </Text>
-              </View>
-            </View>
-          )}
-        />
+                  {/* Raw SMS preview */}
+                  <View style={styles.rawWrap}>
+                    <Text style={styles.rawText} numberOfLines={2}>{tx.raw}</Text>
+                  </View>
+                </View>
+              );
+            }}
+          />
+        )}
       </ScrollView>
     </View>
   );
 }
 
+// ─── STYLES ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0c0c0e',
-    paddingTop: Platform.OS === 'ios' ? 50 : 20,
+    paddingTop: Platform.OS === 'ios' ? 52 : 24,
   },
-  headerContainer: {
+
+  // Header
+  header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 20,
-    paddingBottom: 15,
+    paddingBottom: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#1e1e24',
+    borderBottomColor: '#18181b',
   },
   title: {
     fontSize: 26,
@@ -692,139 +471,102 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     letterSpacing: -0.5,
   },
-  statusRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 6,
-  },
-  badge: {
+  liveRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#16161a',
-    borderRadius: 100,
-    paddingVertical: 3,
-    paddingHorizontal: 8,
-    borderWidth: 1,
-    borderColor: '#24242b',
+    marginTop: 5,
   },
-  dot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
+  liveDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#10b981',
     marginRight: 5,
   },
-  dotGreen: { backgroundColor: '#10b981' },
-  dotYellow: { backgroundColor: '#f59e0b' },
-  dotRed: { backgroundColor: '#ef4444' },
-  badgeText: {
-    fontSize: 9,
-    fontWeight: '700',
-    color: '#a1a1aa',
-    letterSpacing: 0.2,
+  liveText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#10b981',
+    letterSpacing: 1,
   },
-  settingsToggleBtn: {
-    backgroundColor: '#1e1e24',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#2d2d38',
-  },
-  settingsToggleBtnActive: {
-    backgroundColor: '#3b0f14',
-    borderColor: '#e11d48',
-  },
-  settingsBtnText: {
-    color: '#e4e4e7',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  scrollContent: {
-    padding: 20,
-    paddingBottom: 40,
-  },
-  statusBanner: {
-    backgroundColor: '#16161a',
-    borderWidth: 1,
-    borderColor: '#22222b',
-    borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    marginBottom: 20,
-  },
-  statusBannerText: {
-    color: '#d4d4d8',
-    fontSize: 12.5,
+  liveSubtext: {
+    fontSize: 10,
     fontWeight: '500',
-    textAlign: 'center',
+    color: '#52525b',
   },
-  settingsCard: {
-    backgroundColor: '#16161a',
+
+  // Sync Button
+  syncBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#18181b',
     borderWidth: 1,
     borderColor: '#27272a',
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 20,
+    paddingVertical: 9,
+    paddingHorizontal: 14,
+    borderRadius: 12,
   },
-  settingsTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#ffffff',
-    marginBottom: 14,
+  syncBtnActive: {
+    borderColor: '#4f46e5',
+    backgroundColor: '#1e1b4b',
   },
-  inputLabel: {
-    fontSize: 12,
-    fontWeight: '600',
+  syncBtnIcon: { fontSize: 14 },
+  syncBtnText: {
     color: '#a1a1aa',
-    marginBottom: 6,
+    fontSize: 13,
+    fontWeight: '600',
   },
-  inputHelp: {
-    fontSize: 10,
-    color: '#52525b',
-    marginTop: 4,
-    marginBottom: 12,
-    lineHeight: 13,
-  },
-  input: {
-    backgroundColor: '#0c0c0e',
-    color: '#ffffff',
-    borderWidth: 1,
-    borderColor: '#2d2d38',
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    fontSize: 13.5,
-  },
-  settingsActionRow: {
+
+  // Status Bar
+  statusBanner: {
     flexDirection: 'row',
-    justifyContent: 'flex-end',
+    alignItems: 'center',
+    backgroundColor: '#111113',
+    borderBottomWidth: 1,
+    borderBottomColor: '#18181b',
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+  },
+  statusText: {
+    color: '#71717a',
+    fontSize: 11.5,
+    fontWeight: '500',
+    flex: 1,
+  },
+
+  // Scroll
+  scrollContent: {
+    padding: 16,
+    paddingBottom: 50,
+  },
+
+  // Warning
+  warningCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: 10,
-    marginTop: 10,
-  },
-  testBtn: {
-    backgroundColor: '#18181b',
-    paddingVertical: 9,
-    paddingHorizontal: 14,
-    borderRadius: 10,
+    backgroundColor: '#1c1108',
     borderWidth: 1,
-    borderColor: '#2d2d30',
+    borderColor: '#854d0e',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 16,
   },
-  saveBtn: {
-    backgroundColor: '#4f46e5',
-    paddingVertical: 9,
-    paddingHorizontal: 14,
-    borderRadius: 10,
+  warningIcon: { fontSize: 22 },
+  warningTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#fbbf24',
+    marginBottom: 2,
   },
-  btnText: {
-    color: '#d4d4d8',
-    fontSize: 12.5,
-    fontWeight: '600',
+  warningBody: {
+    fontSize: 11,
+    color: '#a16207',
+    lineHeight: 15,
   },
-  saveBtnText: {
-    color: '#ffffff',
-    fontSize: 12.5,
-    fontWeight: '600',
-  },
+
+  // Metric Cards
   metricGrid: {
     flexDirection: 'row',
     gap: 12,
@@ -835,109 +577,125 @@ const styles = StyleSheet.create({
     backgroundColor: '#16161a',
     borderWidth: 1,
     borderColor: '#22222b',
-    borderRadius: 16,
-    padding: 14,
-    position: 'relative',
-    overflow: 'hidden',
+    borderRadius: 18,
+    padding: 16,
   },
   debitCard: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#f43f5e',
+    borderTopWidth: 3,
+    borderTopColor: '#f43f5e',
   },
   creditCard: {
-    borderLeftWidth: 4,
-    borderLeftColor: '#10b981',
+    borderTopWidth: 3,
+    borderTopColor: '#10b981',
+  },
+  metricEmoji: {
+    fontSize: 22,
+    marginBottom: 8,
   },
   metricLabel: {
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: '#71717a',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  metricValue: {
+    fontSize: 17,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+  debitValue: { color: '#f43f5e' },
+  creditValue: { color: '#10b981' },
+  metricSub: {
+    fontSize: 10,
+    color: '#3f3f46',
+    fontWeight: '500',
+  },
+
+  // Section header
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+    gap: 8,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  countPill: {
+    backgroundColor: '#27272a',
+    borderRadius: 100,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+  },
+  countText: {
     fontSize: 11,
     fontWeight: '700',
     color: '#a1a1aa',
-    textTransform: 'uppercase',
   },
-  metricValue: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: '#ffffff',
-    marginTop: 6,
-  },
-  metricLine: {
-    height: 1,
-    width: '100%',
-    backgroundColor: '#27272a',
-    marginTop: 8,
-    opacity: 0.5,
-  },
-  syncButton: {
+
+  // Date Divider
+  dateDivider: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#4f46e5',
-    paddingVertical: 14,
-    borderRadius: 14,
+    marginVertical: 14,
     gap: 8,
-    marginBottom: 25,
-    shadowColor: '#4f46e5',
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 4,
   },
-  syncIcon: {
-    fontSize: 16,
+  dateLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#1e1e24',
   },
-  syncButtonText: {
-    color: '#ffffff',
-    fontSize: 14,
+  datePill: {
+    backgroundColor: '#1a1a22',
+    borderRadius: 100,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#2e2e3a',
+  },
+  datePillText: {
+    fontSize: 11,
     fontWeight: '700',
+    color: '#6366f1',
+    letterSpacing: 0.3,
   },
-  listHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  listSectionTitle: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: '#ffffff',
-  },
-  listSectionCount: {
-    fontSize: 12,
-    color: '#71717a',
-    fontWeight: '500',
-  },
-  emptyContainer: {
+
+  // Empty State
+  emptyCard: {
     backgroundColor: '#16161a',
     borderWidth: 1,
     borderColor: '#22222b',
-    borderRadius: 16,
-    padding: 30,
+    borderRadius: 18,
+    padding: 32,
     alignItems: 'center',
   },
-  emptyIcon: {
-    fontSize: 32,
-    marginBottom: 10,
-  },
-  emptyText: {
+  emptyIcon: { fontSize: 36, marginBottom: 12 },
+  emptyTitle: {
+    fontSize: 15,
+    fontWeight: '700',
     color: '#e4e4e7',
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
     marginBottom: 6,
-  },
-  emptySubtext: {
-    color: '#71717a',
-    fontSize: 11,
     textAlign: 'center',
-    lineHeight: 14,
   },
+  emptyBody: {
+    fontSize: 12,
+    color: '#52525b',
+    textAlign: 'center',
+    lineHeight: 17,
+  },
+
+  // Transaction Card
   txCard: {
     backgroundColor: '#16161a',
     borderWidth: 1,
     borderColor: '#22222b',
     borderRadius: 14,
     padding: 14,
-    marginBottom: 10,
+    marginBottom: 8,
   },
   txDebitBorder: {
     borderLeftWidth: 3,
@@ -949,98 +707,61 @@ const styles = StyleSheet.create({
   },
   txRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
+    alignItems: 'center',
+    gap: 12,
   },
-  txLeft: {
+  txIconWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  txIconDebit: {
+    backgroundColor: '#3b0718',
+  },
+  txIconCredit: {
+    backgroundColor: '#052e16',
+  },
+  txIcon: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#fff',
+  },
+  txMeta: {
     flex: 1,
-    paddingRight: 10,
   },
-  txMerchant: {
+  txName: {
     fontSize: 14,
     fontWeight: '700',
-    color: '#ffffff',
+    color: '#f4f4f5',
   },
   txTime: {
-    fontSize: 10.5,
-    color: '#71717a',
-    marginTop: 4,
-  },
-  txRight: {
-    alignItems: 'flex-end',
+    fontSize: 11,
+    color: '#52525b',
+    marginTop: 2,
+    fontWeight: '500',
   },
   txAmount: {
-    fontSize: 15.5,
+    fontSize: 15,
     fontWeight: '800',
+    textAlign: 'right',
   },
-  txDebitColor: { color: '#f43f5e' },
-  txCreditColor: { color: '#10b981' },
-  syncBadge: {
-    borderRadius: 6,
-    paddingVertical: 2,
-    paddingHorizontal: 6,
-    marginTop: 6,
-  },
-  syncBadgeDone: {
-    backgroundColor: '#10b98115',
-  },
-  syncBadgeLocal: {
-    backgroundColor: '#f59e0b15',
-  },
-  syncBadgeText: {
-    fontSize: 8.5,
-    fontWeight: '700',
-    letterSpacing: 0.3,
-  },
-  syncBadgeTextDone: {
-    color: '#10b981',
-  },
-  syncBadgeTextLocal: {
-    color: '#f59e0b',
-  },
-  rawContainer: {
-    backgroundColor: '#0c0c0e',
+  txDebitAmt: { color: '#f43f5e' },
+  txCreditAmt: { color: '#10b981' },
+
+  // Raw SMS
+  rawWrap: {
+    marginTop: 10,
+    backgroundColor: '#111113',
     borderRadius: 8,
     padding: 8,
-    marginTop: 10,
     borderWidth: 1,
     borderColor: '#1e1e24',
   },
   rawText: {
     fontSize: 10,
-    color: '#52525b',
-    lineHeight: 13,
-  },
-  qrBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1a0f2e',
-    borderWidth: 1,
-    borderColor: '#6d28d9',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 12,
-    gap: 10,
-  },
-  qrBannerIcon: {
-    fontSize: 22,
-  },
-  qrBannerText: {
-    flex: 1,
-  },
-  qrBannerTitle: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: '#a78bfa',
-  },
-  qrBannerSub: {
-    fontSize: 11,
-    color: '#7c6da0',
-    marginTop: 2,
-  },
-  qrBannerArrow: {
-    fontSize: 18,
-    color: '#6d28d9',
-    fontWeight: '700',
+    color: '#3f3f46',
+    lineHeight: 13.5,
   },
 });
