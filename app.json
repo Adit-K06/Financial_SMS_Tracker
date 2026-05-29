@@ -1,25 +1,25 @@
 {
   "expo": {
-    "name": "SMSTracker",
+    "name": "FlashPay",
     "slug": "sms-tracker",
     "version": "1.0.0",
+    "icon": "./assets/logo.png",
+    "splash": {
+      "image": "./assets/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0c0c0e"
+    },
     "android": {
       "package": "com.adit.smstracker",
-      "permissions": [
-        "READ_SMS"
-      ]
-    },
-    "ios": {
-      "bundleIdentifier": "com.adit.smstracker"
-    },
-    "plugins": [
-      "./plugins/withSmsReader"
-    ],
-    "extra": {
-      "eas": {
-        "projectId": "04258406-6ab3-40d3-a312-0a17801d5179"
+      "permissions": ["READ_SMS", "RECEIVE_SMS"],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/logo.png",
+        "backgroundColor": "#0c0c0e"
       }
     },
+    "ios": { "bundleIdentifier": "com.adit.smstracker" },
+    "plugins": ["./plugins/withSmsReader"],
+    "extra": { "eas": { "projectId": "04258406-6ab3-40d3-a312-0a17801d5179" } },
     "owner": "adit_k_2028"
   }
 }
