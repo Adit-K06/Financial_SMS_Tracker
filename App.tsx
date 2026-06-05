@@ -15,9 +15,9 @@ type Transaction = { id: string; type: 'debit' | 'credit'; amount: number; name:
 type ListItem = { kind: 'header'; dateLabel: string; key: string } | { kind: 'tx'; tx: Transaction; key: string };
 type Tab = 'transactions' | 'debts';
 
-function getTodayMidnight(): number {
-  const n = new Date();
-  return new Date(n.getFullYear(), n.getMonth(), n.getDate(), 0, 0, 0, 0).getTime();
+// Fixed cutoff: June 5, 2026 00:00:00 IST
+function getFixedCutoff(): number {
+  return new Date(2026, 5, 5, 0, 0, 0, 0).getTime(); // month is 0-indexed, so 5 = June
 }
 
 function getDateLabel(date: Date): string {
@@ -27,7 +27,26 @@ function getDateLabel(date: Date): string {
   const diff = Math.round((tm - dm) / 86400000);
   if (diff === 0) return 'Today';
   if (diff === 1) return 'Yesterday';
-  return date.toLocaleDateString('en-IN', { weekday: 'long', day: '2-digit', month: 'short' });
+  return date.toLocaleDateString('en-IN', { weekday: 'long', day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+// --- Date boundary helpers ---
+function getStartOfDay(): number {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth(), n.getDate(), 0, 0, 0, 0).getTime();
+}
+
+function getStartOfWeek(): number {
+  const n = new Date();
+  const day = n.getDay(); // 0=Sun
+  const diffToMon = day === 0 ? 6 : day - 1; // Monday-based week
+  const mon = new Date(n.getFullYear(), n.getMonth(), n.getDate() - diffToMon, 0, 0, 0, 0);
+  return mon.getTime();
+}
+
+function getStartOfMonth(): number {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth(), 1, 0, 0, 0, 0).getTime();
 }
 
 function parseSMS(body: string, id: string, dateMs: number): Transaction | null {
@@ -70,6 +89,11 @@ function groupByDate(txs: Transaction[]): ListItem[] {
   return items;
 }
 
+// --- Format currency helper ---
+function fmtINR(n: number): string {
+  return '₹' + n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [status, setStatus] = useState('Initializing...');
@@ -107,22 +131,27 @@ export default function App() {
       setStatus('Scanning SMS inbox...');
     }
     if (!SmsReader) { isSyncingRef.current = false; setIsSyncing(false); return; }
-    const midnight = getTodayMidnight();
+    const cutoff = getFixedCutoff();
     SmsReader.list(
-      JSON.stringify({ box: 'inbox', maxCount: 200, minDate: midnight }),
+      JSON.stringify({ box: 'inbox', maxCount: 500, minDate: cutoff }),
       () => { setStatus('Failed to read SMS.'); isSyncingRef.current = false; setIsSyncing(false); rotateAnim.setValue(0); rotateAnim.stopAnimation(); },
       (_c: number, list: string) => {
         const msgs: Array<{ _id: string; body: string; date: number }> = JSON.parse(list);
-        const txs = msgs.filter(m => m.date >= midnight).map(m => parseSMS(m.body, m._id, m.date)).filter(Boolean) as Transaction[];
+        const txs = msgs.filter(m => m.date >= cutoff).map(m => parseSMS(m.body, m._id, m.date)).filter(Boolean) as Transaction[];
+        // Merge: accumulate all unique transactions, never remove old ones
         setTransactions(prev => {
-          const pIds = new Set(prev.map(t => t.id));
-          const nIds = new Set(txs.map(t => t.id));
-          if (txs.some(t => !pIds.has(t.id)) || prev.some(t => !nIds.has(t.id))) return txs;
-          return prev;
+          const existingMap = new Map(prev.map(t => [t.id, t]));
+          for (const tx of txs) {
+            existingMap.set(tx.id, tx); // add or update
+          }
+          const merged = Array.from(existingMap.values());
+          // Only trigger re-render if count changed or new IDs appeared
+          if (merged.length === prev.length && txs.every(t => prev.some(p => p.id === t.id))) return prev;
+          return merged;
         });
         isSyncingRef.current = false; setIsSyncing(false);
         rotateAnim.setValue(0); rotateAnim.stopAnimation();
-        if (!quiet) setStatus(`Live • ${txs.length} transaction${txs.length !== 1 ? 's' : ''} today`);
+        if (!quiet) setStatus(`Live • ${txs.length} transaction${txs.length !== 1 ? 's' : ''} found`);
       }
     );
   }, []);
@@ -151,8 +180,22 @@ export default function App() {
     return () => sub.remove();
   }, [runSync]);
 
-  const totalDebit = transactions.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
-  const totalCredit = transactions.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+  // --- Compute day / week / month metrics ---
+  const dayStart = getStartOfDay();
+  const weekStart = getStartOfWeek();
+  const monthStart = getStartOfMonth();
+
+  const dayTxs = transactions.filter(t => t.timestamp.getTime() >= dayStart);
+  const weekTxs = transactions.filter(t => t.timestamp.getTime() >= weekStart);
+  const monthTxs = transactions.filter(t => t.timestamp.getTime() >= monthStart);
+
+  const daySpent = dayTxs.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+  const dayEarned = dayTxs.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+  const weekSpent = weekTxs.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+  const weekEarned = weekTxs.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+  const monthSpent = monthTxs.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+  const monthEarned = monthTxs.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+
   const listItems = groupByDate(transactions);
 
   return (
@@ -165,7 +208,7 @@ export default function App() {
         <View style={st.headerLeft}>
           <Image source={logoImg} style={st.logo} />
           <View>
-            <Text style={st.title}>FlashPay</Text>
+            <Text style={st.title}>PayFlash</Text>
             <View style={st.liveRow}>
               <Animated.View style={[st.liveDot, { opacity: pulseAnim }]} />
               <Text style={st.liveText}>LIVE</Text>
@@ -208,25 +251,46 @@ export default function App() {
             </View>
           )}
 
-          {/* Metric Cards */}
+          {/* ── DAY / WEEK / MONTH METRIC CARDS ── */}
           <View style={st.metricRow}>
-            <View style={[st.metricCard, { borderTopColor: '#f43f5e' }]}>
-              <Text style={st.metricEmoji}>💸</Text>
-              <Text style={st.metricLabel}>TOTAL SPENT</Text>
-              <Text style={[st.metricVal, { color: '#f43f5e' }]}>₹{totalDebit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</Text>
-              <Text style={st.metricSub}>{transactions.filter(t => t.type === 'debit').length} debits today</Text>
+            {/* TODAY */}
+            <View style={[st.metricCard, { borderTopColor: '#818cf8' }]}>
+              <Text style={st.metricEmoji}>📅</Text>
+              <Text style={st.metricLabel}>TODAY</Text>
+              <View style={st.metricDivider} />
+              <Text style={st.metricSubLabel}>💸 Spent</Text>
+              <Text style={[st.metricVal, { color: '#f43f5e' }]}>{fmtINR(daySpent)}</Text>
+              <Text style={st.metricSubLabel}>💰 Earned</Text>
+              <Text style={[st.metricVal, { color: '#10b981' }]}>{fmtINR(dayEarned)}</Text>
+              <Text style={st.metricSub}>{dayTxs.length} txn{dayTxs.length !== 1 ? 's' : ''}</Text>
             </View>
-            <View style={[st.metricCard, { borderTopColor: '#10b981' }]}>
-              <Text style={st.metricEmoji}>💰</Text>
-              <Text style={st.metricLabel}>TOTAL RECEIVED</Text>
-              <Text style={[st.metricVal, { color: '#10b981' }]}>₹{totalCredit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</Text>
-              <Text style={st.metricSub}>{transactions.filter(t => t.type === 'credit').length} credits today</Text>
+            {/* THIS WEEK */}
+            <View style={[st.metricCard, { borderTopColor: '#a78bfa' }]}>
+              <Text style={st.metricEmoji}>📊</Text>
+              <Text style={st.metricLabel}>THIS WEEK</Text>
+              <View style={st.metricDivider} />
+              <Text style={st.metricSubLabel}>💸 Spent</Text>
+              <Text style={[st.metricVal, { color: '#f43f5e' }]}>{fmtINR(weekSpent)}</Text>
+              <Text style={st.metricSubLabel}>💰 Earned</Text>
+              <Text style={[st.metricVal, { color: '#10b981' }]}>{fmtINR(weekEarned)}</Text>
+              <Text style={st.metricSub}>{weekTxs.length} txn{weekTxs.length !== 1 ? 's' : ''}</Text>
+            </View>
+            {/* THIS MONTH */}
+            <View style={[st.metricCard, { borderTopColor: '#c084fc' }]}>
+              <Text style={st.metricEmoji}>🗓️</Text>
+              <Text style={st.metricLabel}>THIS MONTH</Text>
+              <View style={st.metricDivider} />
+              <Text style={st.metricSubLabel}>💸 Spent</Text>
+              <Text style={[st.metricVal, { color: '#f43f5e' }]}>{fmtINR(monthSpent)}</Text>
+              <Text style={st.metricSubLabel}>💰 Earned</Text>
+              <Text style={[st.metricVal, { color: '#10b981' }]}>{fmtINR(monthEarned)}</Text>
+              <Text style={st.metricSub}>{monthTxs.length} txn{monthTxs.length !== 1 ? 's' : ''}</Text>
             </View>
           </View>
 
           {/* Section Header */}
           <View style={st.secRow}>
-            <Text style={st.secTitle}>Today's Transactions</Text>
+            <Text style={st.secTitle}>All Transactions</Text>
             <View style={st.pill}><Text style={st.pillText}>{transactions.length}</Text></View>
           </View>
 
@@ -234,8 +298,8 @@ export default function App() {
           {listItems.length === 0 ? (
             <View style={st.empty}>
               <Text style={{ fontSize: 36, marginBottom: 12 }}>📭</Text>
-              <Text style={st.emptyTitle}>No transactions today</Text>
-              <Text style={st.emptyBody}>We're monitoring your SMS inbox from this morning. Bank transaction messages will appear here automatically.</Text>
+              <Text style={st.emptyTitle}>No transactions yet</Text>
+              <Text style={st.emptyBody}>We're monitoring your SMS inbox from June 5, 2026 onwards. Bank transaction messages will appear here automatically.</Text>
             </View>
           ) : (
             <FlatList data={listItems} scrollEnabled={false} keyExtractor={i => i.key} renderItem={({ item }) => {
@@ -295,12 +359,14 @@ const st = StyleSheet.create({
   warn: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#1c1108', borderWidth: 1, borderColor: '#854d0e', borderRadius: 14, padding: 14, marginBottom: 16 },
   warnTitle: { fontSize: 13, fontWeight: '700', color: '#fbbf24', marginBottom: 2 },
   warnBody: { fontSize: 11, color: '#a16207', lineHeight: 15 },
-  metricRow: { flexDirection: 'row', gap: 12, marginBottom: 20 },
-  metricCard: { flex: 1, backgroundColor: '#16161a', borderWidth: 1, borderColor: '#22222b', borderRadius: 18, padding: 14, borderTopWidth: 3 },
-  metricEmoji: { fontSize: 20, marginBottom: 6 },
-  metricLabel: { fontSize: 10, fontWeight: '700', color: '#71717a', letterSpacing: 0.5, marginBottom: 4 },
-  metricVal: { fontSize: 17, fontWeight: '800', marginBottom: 4 },
-  metricSub: { fontSize: 10, color: '#3f3f46', fontWeight: '500' },
+  metricRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
+  metricCard: { flex: 1, backgroundColor: '#16161a', borderWidth: 1, borderColor: '#22222b', borderRadius: 16, padding: 10, borderTopWidth: 3 },
+  metricEmoji: { fontSize: 16, marginBottom: 2 },
+  metricLabel: { fontSize: 9, fontWeight: '800', color: '#a1a1aa', letterSpacing: 0.5, marginBottom: 2 },
+  metricDivider: { height: 1, backgroundColor: '#22222b', marginVertical: 4 },
+  metricSubLabel: { fontSize: 8, fontWeight: '600', color: '#52525b', marginBottom: 1 },
+  metricVal: { fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  metricSub: { fontSize: 9, color: '#3f3f46', fontWeight: '500', marginTop: 2 },
   secRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12, gap: 8 },
   secTitle: { fontSize: 16, fontWeight: '800', color: '#fff' },
   pill: { backgroundColor: '#27272a', borderRadius: 100, paddingHorizontal: 8, paddingVertical: 2 },
